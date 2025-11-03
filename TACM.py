@@ -30,7 +30,8 @@ class TwitchAutoCategory:
         self.monitor_thread = None
         self.stop_monitoring = False
         self.current_category = "Just Chatting"
-        
+        self.last_update_time = 0
+
         # Game mappings
         self.process_priorities = {}    # exe -> priority (int)
         self.process_categories = {}    # exe -> category (str)
@@ -404,37 +405,38 @@ class TwitchAutoCategory:
             resp.raise_for_status()
             apps = resp.json()
             exe_map = {}
-            
+
             for app in apps:
                 game_name = app.get("name")
                 if not game_name:
                     continue
-                
+
                 # Map executables
                 executables = app.get("executables", [])
                 for exe_entry in executables:
                     exe_name = exe_entry.get("name")
                     os_type = exe_entry.get("os")
                     if exe_name and os_type == "win32":
-                        exe_map[exe_name.casefold()] = game_name
-                
+                        exe_map[os.path.basename(exe_name).casefold()] = game_name  # <-- strip path here
+
                 # Map aliases
                 for alias in app.get("aliases", []):
-                    exe_map[alias.casefold()] = game_name
-            
+                    exe_map[os.path.basename(alias).casefold()] = game_name  # <-- strip path here
+
             # Save to cache
             with open(cache_path, 'w', encoding='utf-8') as f:
                 json.dump({
                     "_fetched_at": int(time.time()),
                     "exe_map": exe_map
                 }, f, indent=2)
-            
+
             with self.cache_lock:
                 self.discord_exe_map = exe_map
-            
+
             self.log(f"Fetched and cached Discord DB ({len(exe_map)} executables).")
         except Exception as e:
             self.log(f"Failed to fetch Discord DB: {e}", obs.LOG_WARNING)
+
     
     def manual_refresh_discord(self):
         """Manually refresh Discord database"""
@@ -446,9 +448,6 @@ class TwitchAutoCategory:
     
     def update_twitch_category(self, category):
         """Update Twitch stream category"""
-        if category == self.current_category:
-            return
-        
         with self.token_lock:
             if not self.access_token:
                 self.log("Not authenticated with Twitch. Please login first.", obs.LOG_WARNING)
@@ -457,8 +456,7 @@ class TwitchAutoCategory:
                 'Client-ID': self.client_id,
                 'Authorization': f'Bearer {self.access_token}'
             }
-        
-        # Get broadcaster info
+
         config_path = os.path.join(os.path.dirname(__file__), 'config.json')
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
@@ -470,135 +468,151 @@ class TwitchAutoCategory:
         except Exception as e:
             self.log(f"Error reading config.json: {e}", obs.LOG_WARNING)
             return
-        
+
         try:
-            # Get broadcaster ID
+            self.log(f"Fetching broadcaster ID for: {broadcaster_name}")
             user_response = requests.get(
                 f'https://api.twitch.tv/helix/users?login={broadcaster_name}',
                 headers=headers, timeout=10
             )
+            self.log(f"User API: {user_response.status_code} -> {user_response.text[:200]}")
             user_response.raise_for_status()
             user_data = user_response.json()['data']
             if not user_data:
                 self.log(f"Broadcaster not found: {broadcaster_name}", obs.LOG_WARNING)
                 return
             broadcaster_id = user_data[0]['id']
-            
-            # Search for category
+
+            self.log(f"Searching category: {category}")
             category_response = requests.get(
                 f'https://api.twitch.tv/helix/search/categories?query={category}',
                 headers=headers, timeout=10
             )
+            self.log(f"Search API: {category_response.status_code} -> {category_response.text[:200]}")
             category_response.raise_for_status()
             categories = category_response.json()['data']
-            
+
             if not categories:
                 self.log(f"Category not found: {category}", obs.LOG_WARNING)
                 return
-            
-            # Find exact match or use first result
+
             exact_match = next(
                 (cat for cat in categories if cat['name'].casefold() == category.casefold()),
                 None
             )
             game_id = exact_match['id'] if exact_match else categories[0]['id']
-            
+
             if not exact_match:
                 self.log(f"Using closest match: {categories[0]['name']}")
-            
-            # Update channel
+
+            self.log(f"Updating Twitch channel category to {category} (game_id={game_id})")
             update_response = requests.patch(
                 f'https://api.twitch.tv/helix/channels?broadcaster_id={broadcaster_id}',
                 headers=headers,
                 json={'game_id': game_id},
                 timeout=10
             )
+            self.log(f"Patch API: {update_response.status_code} -> {update_response.text[:200]}")
             update_response.raise_for_status()
-            
+
             self.current_category = category
             self.log(f"✓ Updated Twitch category to: {category}")
         except requests.exceptions.RequestException as e:
             self.log(f"Failed to update category: {e}", obs.LOG_WARNING)
-            
-            # Try to refresh token if unauthorized
+            if hasattr(e, 'response') and e.response is not None:
+                self.log(f"Twitch response: {e.response.status_code} -> {e.response.text[:200]}")
             if hasattr(e, 'response') and e.response is not None and e.response.status_code == 401:
                 self.log("Token may be expired. Attempting to refresh...")
                 if self.refresh_access_token():
-                    # Retry once after refresh
                     self.update_twitch_category(category)
 
     # ========== Process Detection ==========
-    
+
     def check_processes(self):
-        """
-        Check running processes and return selected category.
-        Priority order:
-        1. Custom mappings (games.json) - by priority value
-        2. Discord database (fallback, priority 0)
-        3. "Just Chatting" (default)
-        """
+        highest_priority = -1
+        selected_category = None
+        triggered_process = None
+
+        pp = {k.casefold().strip(): v for k, v in self.process_priorities.items()}
+        pc = {k.casefold().strip(): v for k, v in self.process_categories.items()}
+
+        # Take snapshot of Discord DB
+        with self.cache_lock:
+            discord_map = dict(self.discord_exe_map)
+
+        self.log("=== Starting full process debug ===")
+
         try:
-            highest_priority = -1
-            selected_category = None
-            
-            # Prepare lowercase lookup
-            pp = {k.casefold(): v for k, v in self.process_priorities.items()}
-            pc = {k.casefold(): v for k, v in self.process_categories.items()}
-            
-            # Get Discord map snapshot (thread-safe)
-            with self.cache_lock:
-                discord_map = dict(self.discord_exe_map)
-            
             for proc in psutil.process_iter(['name']):
                 pname = proc.info.get('name') or ""
-                if not pname:
+                name = pname.casefold().strip()
+                if not name:
                     continue
-                name = pname.casefold()
-                
-                # Check custom mappings first (higher priority)
+
+                # Custom mapping first
                 if name in pc:
                     prio = pp.get(name, 0)
+                    debug_msg = f"Matched custom mapping: '{pname}' -> '{pc[name]}' (priority {prio})"
                     if prio > highest_priority:
                         highest_priority = prio
                         selected_category = pc[name]
+                        triggered_process = pname
+                        debug_msg += " [Selected]"
+                    self.log(debug_msg)
                     continue
-                
-                # Fallback to Discord database (priority 0)
+
+                # Discord fallback
                 if name in discord_map:
-                    if 0 > highest_priority:
+                    debug_msg = f"Matched Discord DB: '{pname}' -> '{discord_map[name]}' (priority 0)"
+                    if highest_priority < 0:
                         highest_priority = 0
                         selected_category = discord_map[name]
-            
+                        triggered_process = pname
+                        debug_msg += " [Selected]"
+                    self.log(debug_msg)
+                    continue
+
+            self.log(f"=== Process check complete. Selected category: {selected_category or 'Just Chatting'} (triggered by: {triggered_process}) ===")
+
             return selected_category or "Just Chatting"
+
         except Exception as e:
             self.log(f"Error checking processes: {e}", obs.LOG_WARNING)
             return "Just Chatting"
 
     # ========== Process Monitor Thread ==========
-    
+
     def start_process_monitor(self):
-        """Start background thread to monitor processes"""
         self.stop_monitoring = False
-        
+
         def monitor():
             while not self.stop_monitoring:
                 try:
-                    # Validate token periodically
+                    self.log("Monitor loop tick started.")
+
+                    # Validate token
                     if not self.validate_token():
+                        self.log("Token invalid, trying to refresh...")
                         if not self.refresh_access_token():
-                            self.log("Token invalid and refresh failed. Please re-authenticate.")
+                            self.log("Token refresh failed.")
                             time.sleep(60)
                             continue
-                    
-                    # Check processes and update category
+                        else:
+                            self.log("Token refreshed successfully.")
+
+                    # Check processes
                     category = self.check_processes()
+                    now = time.time()
+
+                    # Always update Twitch category if a process was detected
                     self.update_twitch_category(category)
-                    
+                    self.last_update_time = now
+
                 except Exception as e:
                     self.log(f"Monitor error: {e}", obs.LOG_WARNING)
-                
-                time.sleep(60)  # Check every 60 seconds
-        
+
+                time.sleep(60)
+
         self.monitor_thread = threading.Thread(target=monitor, daemon=True)
         self.monitor_thread.start()
         self.log("Process monitor started.")
