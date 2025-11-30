@@ -41,7 +41,7 @@ Supports custom game mappings and the Discord detectable apps database as a fall
 
 11. Name the application however you want and in `OAuth Redirect URLs` paste this in:
      ```json
-     http://localhost
+     http://localhost:17563
   Like so:
   <img width="971" height="279" alt="image" src="https://github.com/user-attachments/assets/ae94c407-d23a-4032-a5fd-3beba27661f3" />
 
